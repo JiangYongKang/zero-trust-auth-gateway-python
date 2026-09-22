@@ -130,13 +130,16 @@ class AuthGateway:
         try:
             claims = self.authenticate(token, request_id=rid)
 
-            # 主体以令牌为准，忽略请求自报身份，避免越权伪造
+            # 主体以令牌为准，忽略请求自报身份，避免越权伪造。
+            # 属性合并：令牌属性是权威基线，请求体只能补充令牌中不存在的
+            # 属性（不能覆盖令牌同名属性），保证身份相关属性不可被请求翻转。
+            bound_attrs = dict(req.attributes)
+            bound_attrs.update(dict(claims.attributes))
             bound = AuthzRequest(
                 principal=claims.sub,
                 action=req.action,
                 resource=req.resource,
-                # 令牌属性与请求属性合并；请求属性不可覆盖令牌中同名属性
-                attributes={**req.attributes, **dict(claims.attributes)},
+                attributes=bound_attrs,
             )
             self._log.info(
                 "authorize evaluating %s",

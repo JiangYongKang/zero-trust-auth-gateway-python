@@ -107,3 +107,14 @@ def test_decision_reproducible_with_same_policy_version(gateway, make_token) -> 
         r2.policy_version,
         r2.basis,
     )
+
+
+def test_request_body_cannot_override_token_attributes(gateway, make_token) -> None:
+    # 令牌带 dept=eng，请求体试图改为其他值：以令牌为准，仍按 eng 放行
+    from ztauth.policy import AuthzRequest as AR
+
+    tok = make_token(gateway)
+    forged = AR(principal="alice", action="read", resource="db",
+                attributes={"dept": "HACKED"})
+    auth = gateway.authorize(tok, forged, request_id="req-attr-guard-1")
+    assert auth.allowed is True and auth.basis == "allow-alice-db"

@@ -222,8 +222,11 @@ def main(argv: list[str] | None = None) -> int:
     p_mint.add_argument("dir")
     p_mint.add_argument("--sub", default="alice")
     p_mint.add_argument("--ttl", type=float, default=300.0)
-    p_mint.add_argument("--scope", action="append", default=["db:read"])
-    p_mint.add_argument("--attr", action="append", default=["dept=eng"])
+    p_mint.add_argument("--scope", action="append", default=None)
+    p_mint.add_argument(
+        "--attr", action="append", default=None,
+        help="key=value，可重复；省略时默认 dept=eng",
+    )
     args = parser.parse_args(argv)
 
     if args.cmd == "init":
@@ -232,10 +235,12 @@ def main(argv: list[str] | None = None) -> int:
 
     keys = load_keys(Path(args.dir) / KEYS_FILE)
     keyring = Keyring(StaticKeySource(keys), overlap_seconds=60.0, clock=time.time)
-    attrs = dict(a.split("=", 1) for a in args.attr)
+    scopes = args.scope if args.scope is not None else ["db:read"]
+    attr_args = args.attr if args.attr is not None else ["dept=eng"]
+    attrs = dict(a.split("=", 1) for a in attr_args)
     token, claims = issue_token(
         keyring, sub=args.sub, ttl_seconds=args.ttl,
-        scopes=set(args.scope), attributes=attrs,
+        scopes=set(scopes), attributes=attrs,
     )
     print(token)
     print(f"# kid={claims.kid} sub={claims.sub} exp={claims.expires_at:.0f}")
