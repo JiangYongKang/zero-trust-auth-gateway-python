@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地生成的密钥/策略/凭据材料（含明文，禁止提交）
+local-material/
+zt-material/
+*.local.json
