@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "allow-payments-read-db",
+      "effect": "allow",
+      "action": "read",
+      "resource": "db-payments",
+      "require": {"team": "payments"},
+      "roles": ["reader"]
+    },
+    {
+      "id": "deny-contractor",
+      "effect": "deny",
+      "action": "read",
+      "resource": "db-payments",
+      "require": {"employment": "contractor"},
+      "roles": ["reader"]
+    }
+  ]
+}
