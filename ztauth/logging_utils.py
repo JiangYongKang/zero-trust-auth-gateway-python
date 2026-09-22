@@ -71,6 +71,11 @@ def current_policy_version() -> str:
     return _POLICY_VERSION.get()
 
 
+def set_policy_version(version: int | str) -> None:
+    """在同一请求上下文内更新策略版本（判定完成后调用）。"""
+    _POLICY_VERSION.set(str(version))
+
+
 def redact(value: Any, *, key: str | None = None) -> str:
     """把任意值转为不含敏感材料的安全字符串。
 
