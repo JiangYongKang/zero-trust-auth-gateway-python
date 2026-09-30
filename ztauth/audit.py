@@ -15,6 +15,7 @@ class AuditEntry:
     effect: str
     policy_version: int | None
     rationale: str
+    release_id: int | None = None
 
 
 class AuditLogger:
@@ -34,6 +35,8 @@ class AuditLogger:
         resource: str,
         reason: str,
         policy_version: int | None = None,
+        *,
+        release_id: int | None = None,
     ) -> None:
         self.record(
             AuditEntry(
@@ -44,5 +47,6 @@ class AuditLogger:
                 effect="deny",
                 policy_version=policy_version,
                 rationale=reason,
+                release_id=release_id,
             )
         )

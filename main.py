@@ -1,9 +1,14 @@
-"""本地可运行的零信任网关演示装配。
+"""本地可运行的零信任网关演示装配（发布批次模式）。
 
 启动：
     uv run uvicorn main:app --reload
+
 所有密钥材料、策略与凭据均在本地构造/读取，不依赖任何外部服务。
-修改 examples/policy.json 后调用 POST /v1/policies/reload 即可热生效。
+初始配置作为发布标识 1 的批次加载；之后通过
+    POST /v1/releases/publish   发布源中的新整批配置
+    POST /v1/releases/rollback  {"release_id": N}  回退到保留期内的批次
+完成"同批生效、整批回退"。修改 examples/policy.json 后再 publish 即可。
+未配置发布批次的原有单项路径仍可直接使用 Gateway(ring, policies, vault)。
 """
 from __future__ import annotations
 
@@ -16,31 +21,27 @@ from ztauth.audit import AuditLogger
 from ztauth.credentials import (
     Credential,
     CredentialVersion,
-    InMemoryCredentialVault,
     VersionState,
 )
 from ztauth.gateway import Gateway
-from ztauth.keys import KeyRing, SigningKey
-from ztauth.policy import PolicyStore
-from ztauth.sources import JsonPolicySource, MutableKeySource
+from ztauth.keys import SigningKey
+from ztauth.releases import ReleaseContent, ReleaseManager
+from ztauth.sources import JsonPolicySource, MutableReleaseSource
 
 _HERE = pathlib.Path(__file__).parent
 
 
-def _build() -> Gateway:
-    now = dt.datetime.now(dt.timezone.utc)
-    # 本地生成的签名密钥材料（演示用固定字节；生产应由密钥源提供）
-    keys = [
+def _initial_content(now: dt.datetime) -> ReleaseContent:
+    keys = (
         SigningKey("k-old", os.urandom(32),
                    now - dt.timedelta(days=30), now + dt.timedelta(days=1),
                    "retiring"),
         SigningKey("k-current", os.urandom(32),
                    now - dt.timedelta(hours=1), now + dt.timedelta(days=30),
                    "active"),
-    ]
-    ring = KeyRing(MutableKeySource(keys, version=1))
-    policies = PolicyStore(JsonPolicySource(_HERE / "examples" / "policy.json"))
-    vault = InMemoryCredentialVault({
+    )
+    policy = JsonPolicySource(_HERE / "examples" / "policy.json").load()
+    credentials = {
         "db-payments": Credential(
             name="db-payments",
             allowed_roles=("reader",),
@@ -48,9 +49,17 @@ def _build() -> Gateway:
                 CredentialVersion(1, os.urandom(32), VersionState.CURRENT, None),
             ),
         ),
-    })
-    return Gateway(ring, policies, vault, AuditLogger())
+    }
+    return ReleaseContent(keys=keys, policy=policy,
+                          credentials=credentials, keys_version=1)
 
 
-gateway = _build()
+def _build() -> tuple[Gateway, MutableReleaseSource]:
+    now = dt.datetime.now(dt.timezone.utc)
+    source = MutableReleaseSource(_initial_content(now))
+    manager = ReleaseManager(source, max_retained=8)
+    return Gateway(released=manager, audit=AuditLogger()), source
+
+
+gateway, release_source = _build()
 app = create_app(gateway)

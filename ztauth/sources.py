@@ -1,4 +1,4 @@
-"""本地源：内存密钥源（可热切换）、JSON 文件策略源（热更新）。"""
+"""本地源：内存密钥源 / JSON 文件策略源 / 内存发布批次源。"""
 from __future__ import annotations
 
 import json
@@ -6,6 +6,7 @@ import pathlib
 
 from .keys import SigningKey
 from .policy import Policy, Rule
+from .releases import ReleaseContent
 
 
 class MutableKeySource:
@@ -67,3 +68,22 @@ class JsonPolicySource:
             for r in data["rules"]
         )
         return Policy(version=int(data["version"]), rules=rules)
+
+
+class MutableReleaseSource:
+    """测试/本地用发布源：set_content 后 publish/受控回源即可见到新整批。
+
+    load_count 统计真正的上游读取次数（构造期可选择不计），用于断言
+    "同批并发只真正读取一次"与"未知 kid 冲击下读取次数有上限"。
+    """
+
+    def __init__(self, content: ReleaseContent) -> None:
+        self._content = content
+        self.load_count = 0
+
+    def set_content(self, content: ReleaseContent) -> None:
+        self._content = content
+
+    def load(self) -> ReleaseContent:
+        self.load_count += 1
+        return self._content

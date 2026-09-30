@@ -17,27 +17,35 @@ JSON 策略与内存凭据库即可运行，无外部依赖（仅 FastAPI + pyte
 | `ztauth/keys.py` | 密钥集合：重叠窗口轮换、原子快照、未知 kid 受控重载（single-flight） |
 | `ztauth/policy.py` | 版本化本地策略：默认拒绝、显式拒绝优先、属性缺失单列 |
 | `ztauth/credentials.py` | 版本化凭据：重叠轮换、最小权限、过期/失效语义 |
-| `ztauth/gateway.py` | 三段链路门面，统一错误原因与审计 |
-| `ztauth/audit.py` | 结构化审计（请求标识、策略版本、判定依据） |
-| `ztauth/api.py` | FastAPI 端点 `/v1/authorize`、`/v1/policies/reload` |
-| `ztauth/sources.py` | 本地密钥源 / JSON 文件策略源 |
-| `main.py` | 本地可运行演示装配 |
-| `tests/` | 密钥轮换 / 策略热更新 / 凭据 / 并发鉴权 / 端到端 |
+| `ztauth/releases.py` | 发布批次：整批发布/回退、在途固定、保留淘汰、未知 kid 受控回源 |
+| `ztauth/gateway.py` | 三段链路门面，统一错误原因与审计（支持发布批次） |
+| `ztauth/audit.py` | 结构化审计（请求标识、策略版本、发布批次、判定依据） |
+| `ztauth/api.py` | FastAPI 端点 `/v1/authorize`、`/v1/policies/reload`、`/v1/releases/*` |
+| `ztauth/sources.py` | 本地密钥源 / JSON 文件策略源 / 内存发布批次源 |
+| `main.py` | 本地可运行演示装配（默认运行在发布批次模式） |
+| `tests/` | 密钥轮换 / 策略热更新 / 凭据 / 并发鉴权 / 发布批次 / 端到端 |
 
 ## 快速开始
 
 ```bash
 uv sync
-uv run pytest -q                       # 本地验证（23 个用例）
-uv run uvicorn main:app --reload       # 启动演示服务
+uv run pytest -q                       # 本地验证（45 个用例）
+uv run uvicorn main:app --reload       # 启动演示服务（发布批次模式）
 ```
 
-签发一个演示令牌并调用：
+签发一个演示令牌并调用（演示服务运行在发布批次模式，从当前批次取密钥）：
 
 ```python
 import datetime as dt
+from ztauth.keys import KeyRing
 from ztauth.tokens import TokenIssuer
-ring = __import__("main").gateway._verifier  # 仅演示取密钥环
+import main
+
+rel = main.gateway.current_release_id()
+content = main.gateway._releases.current().content          # 当前发布批次
+ring = KeyRing(type("S", (), {                               # 用批次密钥构造签发环
+    "load": lambda self: (list(content.keys), content.keys_version),
+})())
 token = TokenIssuer(ring).issue(
     "alice", ttl=dt.timedelta(minutes=5),
     roles=("reader",), attrs={"team": "payments"},
@@ -50,11 +58,34 @@ token = TokenIssuer(ring).issue(
 
 - `POST /v1/authorize`
   - 请求：`{"token", "action", "resource", "credential_version"?: int}`
-  - `200`：`{request_id, subject, effect, policy_version, rationale,
+  - `200`：`{request_id, subject, effect, policy_version, release_id, rationale,
     credential: {name, version, not_after, secret(base64)}}`
-  - `403`：`{"error": <可区分原因>, "detail": ...}`（**不含**凭据/令牌内容）
+  - `403`：`{"error": <可区分原因>, "detail": ..., "release_id": ...}`
+    （**不含**凭据/令牌内容；未启用批次时 `release_id` 为 `null`）
   - 建议头：`X-Request-Id`；缺省时自动生成。
-- `POST /v1/policies/reload`：策略热更新，返回新 `policy_version`。
+- `POST /v1/policies/reload`：策略热更新（原有单项路径），返回新 `policy_version`。
+- `POST /v1/releases/publish`：从已配置发布源读取最新整批并发布，返回
+  `{release_id}`；`POST /v1/releases/current` 查询当前批次；
+  `POST /v1/releases/rollback`（`{"release_id": N}`）回退。
+
+## 发布批次（整批生效、整批回退）
+
+一次上线同时换密钥、改规则、换凭据版本时，用 `ReleaseManager` 把三者作为
+**一个不可变批次**提交，得到唯一且单调递增的发布标识；新请求完整使用同一批次，
+成功与失败都返回/记录实际使用的 `release_id`。回退按标识切回保留期内批次，
+`never_existed`（从未存在）与 `retired`（已过保留期）两种错误明确可区分；
+正在处理的请求按开始时固定的批次完整结束，不被中途换版。
+
+- 历史批次保留上限可配置（`max_retained`，默认 8）；超限按**发布标识最旧优先**
+  淘汰，但当前批次与仍有在途请求的批次不会被提前淘汰（容量可能临时超限）。
+- 未知 kid 受控回源：同 kid 并发合并为一次真实上游读取（single-flight），
+  另有有界 LRU 负缓存（`negative_cache_size`，默认 256），未知标识持续冲击下
+  真实读取次数有确定上限；每次发布清空负缓存。
+- 与原有单项能力（密钥重叠轮换、策略热更新、凭据 rotate/retire）**互不影响**：
+  仍可直接使用 `Gateway(ring, policies, vault)`；批次模式构造为
+  `Gateway(released=manager)`，原有 23 个用例全部保留。
+
+详见 [`docs/RELEASES.md`](docs/RELEASES.md)。
 
 ## 拒绝原因（可区分）
 
@@ -77,7 +108,8 @@ token = TokenIssuer(ring).issue(
   当前版本，也可显式引用重叠期旧版本；引用不存在/已失效版本分别报
   `version_not_found` / `version_retired`。
 
-详见 [`docs/AUTHZ.md`](docs/AUTHZ.md)。
+详见 [`docs/AUTHZ.md`](docs/AUTHZ.md)；发布批次的完整语义与边界见
+[`docs/RELEASES.md`](docs/RELEASES.md)。
 
 ## 本地验证
 
@@ -87,7 +119,11 @@ uv run pytest tests/test_key_rotation.py -q
 uv run pytest tests/test_policy_hot_reload.py -q
 uv run pytest tests/test_credentials.py -q
 uv run pytest tests/test_concurrent_authz.py -q
-uv run pytest -o log_cli=true -o log_cli_level=INFO   # 打印请求标识/策略版本/依据
+uv run pytest tests/test_releases.py -q             # 发布/回退/淘汰/负缓存
+uv run pytest tests/test_release_gateway.py -q      # 三段同批、在途不换版
+uv run pytest tests/test_release_concurrency.py -q  # 发布回退×并发鉴权交错
+uv run pytest tests/test_release_api.py -q          # HTTP 发布/回退/两类404
+uv run pytest -o log_cli=true -o log_cli_level=INFO   # 打印请求标识/批次/版本/依据
 ```
 
 测试日志为单行 JSON：
@@ -95,7 +131,8 @@ uv run pytest -o log_cli=true -o log_cli_level=INFO   # 打印请求标识/策�
 ```json
 ztauth_decision {"request_id":"rq-cred","subject":"alice","action":"read",
  "resource":"db-payments","effect":"allow","policy_version":1,
- "rationale":"rule p1-...: allow matched (policy v1); credential v1"}
+ "rationale":"rule p1-...: allow matched (policy v1); credential v1",
+ "release_id":1}
 ```
 
 凭据明文与令牌字符串**绝不会**出现在日志或错误信息中（有专门断言守护）。

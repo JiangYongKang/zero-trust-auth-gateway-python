@@ -73,10 +73,19 @@
 ## 4. 审计
 
 每次判定输出一行 JSON：`request_id / subject / action / resource / effect /
-policy_version / rationale`。令牌本身、令牌片段与凭据明文一律不记录。
+policy_version / rationale / release_id`。令牌本身、令牌片段与凭据明文一律不
+记录。`release_id` 为本次请求实际使用的发布批次标识（见
+[RELEASES.md](RELEASES.md)）；未启用发布批次时为 `null`。
 单测中使用 `pytest -o log_cli=true -o log_cli_level=INFO` 可直接查看。
 
-## 5. 本地测试矩阵
+## 5. 发布批次
+
+当一次变更需要同时换密钥、改规则、换凭据版本时，使用发布批次把三者作为一个
+不可变整体提交，得到单调递增的发布标识；请求三段链路固定同批、可整批回退、
+历史批次按确定规则保留淘汰。语义、边界与兼容范围见
+[RELEASES.md](RELEASES.md)。
+
+## 6. 本地测试矩阵
 
 | 文件 | 覆盖点 |
 | --- | --- |
@@ -84,4 +93,8 @@ policy_version / rationale`。令牌本身、令牌片段与凭据明文一律�
 | `tests/test_policy_hot_reload.py` | 默认拒绝、deny 优先、缺属性单列、文件改写后热生效、结论可复现 |
 | `tests/test_credentials.py` | 最小权限、版本不存在/已失效区分、重叠期语义、过期、日志无明文 |
 | `tests/test_concurrent_authz.py` | 混合请求结论稳定、热更新不跨版本脏读、32 并发未知 kid 合并拉取 |
+| `tests/test_releases.py` | 单调发布标识、回退 never_existed/retired 区分、最旧优先淘汰、在途保护不提前淘汰、未知 kid 冲击读取上限、负缓存 LRU 边界、与单项轮换正交 |
+| `tests/test_release_gateway.py` | 三段同批一致、成功/失败带发布标识、回退中途不换版、网关层两类回退错误 |
+| `tests/test_release_concurrency.py` | 发布/回退与 8 路鉴权交错不跨批、高频发布无空窗误拒、同批并发只读取一次 |
+| `tests/test_release_api.py` | HTTP 发布/回退/current、403 带批次、两类 404、旧装配无管理端点 |
 | `tests/test_api_e2e.py` | HTTP 200/403、错误体可区分且不含机密、热更新端点 |
