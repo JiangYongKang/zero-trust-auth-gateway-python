@@ -59,6 +59,21 @@ def _fresh(v: CredentialVersion, now: dt.datetime) -> bool:
     return v.not_after is None or now < v.not_after
 
 
+class FrozenCredentialStore:
+    """发布批次内的不可变凭据快照：只读 load_all，不支持轮换。
+
+    它满足 read_credential 所需的 CredentialStore 协议，使一个请求全程读取
+    固定批次中的凭据版本集合，不受并发轮换影响。
+    """
+
+    def __init__(self, snapshot: dict[str, Credential]) -> None:
+        self._snapshot = dict(snapshot)
+
+    def load_all(self) -> dict[str, Credential]:
+        # 返回浅拷贝，Credential 本身是不可变对象，可安全共享
+        return dict(self._snapshot)
+
+
 class InMemoryCredentialVault:
     """线程安全的本地凭据库快照，供测试与本地验证使用。"""
 

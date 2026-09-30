@@ -22,6 +22,7 @@ from ztauth.credentials import (
 from ztauth.gateway import Gateway
 from ztauth.keys import KeyRing, SigningKey
 from ztauth.policy import PolicyStore
+from ztauth.releases import InMemoryReleaseSource, ReleaseManager, ReleasePayload
 from ztauth.sources import JsonPolicySource, MutableKeySource
 
 _HERE = pathlib.Path(__file__).parent
@@ -49,7 +50,18 @@ def _build() -> Gateway:
             ),
         ),
     })
-    return Gateway(ring, policies, vault, AuditLogger())
+    # 初始批次 id=1：把三组件当前状态打包为发布起点；保留最近 10 个历史批次
+    initial = ReleasePayload(
+        release_id=1,
+        keys=tuple(ring.snapshot()[0]),
+        key_version=ring.version(),
+        policy=policies.current(),
+        credentials=vault.load_all(),
+    )
+    releases = ReleaseManager(
+        InMemoryReleaseSource(initial), retain=10,
+    )
+    return Gateway(ring, policies, vault, AuditLogger(), releases=releases)
 
 
 gateway = _build()

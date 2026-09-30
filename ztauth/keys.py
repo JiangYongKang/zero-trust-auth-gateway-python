@@ -41,6 +41,47 @@ class KeySource(Protocol):
         ...
 
 
+class FrozenKeyRing:
+    """只读不可变密钥环：发布批次内的固定密钥集，不会触发任何重载。
+
+    接口是 KeyRing 的只读子集（lookup / find / version / current_signing_key），
+    因此可直接传给 TokenVerifier / TokenIssuer。
+    """
+
+    def __init__(self, keys: list[SigningKey], version: int) -> None:
+        self._version = version
+        self._keys: dict[str, SigningKey] = {k.kid: k for k in keys}
+
+    def version(self) -> int:
+        return self._version
+
+    def _within_window(self, key: SigningKey, now: dt.datetime) -> bool:
+        return key.not_before <= now < key.not_after
+
+    def lookup(self, kid: str, *, now: dt.datetime | None = None) -> LookupResult:
+        now = now or dt.datetime.now(dt.timezone.utc)
+        key = self._keys.get(kid)
+        if key is None:
+            return LookupResult("unknown")
+        if self._within_window(key, now):
+            return LookupResult("found", key)
+        return LookupResult("outside_window", key)
+
+    def find(self, kid: str, *, now: dt.datetime | None = None) -> SigningKey | None:
+        result = self.lookup(kid, now=now)
+        return result.key if result.kind == "found" else None
+
+    def current_signing_key(self, *, now: dt.datetime | None = None) -> SigningKey:
+        now = now or dt.datetime.now(dt.timezone.utc)
+        candidates = [
+            k for k in self._keys.values()
+            if k.state == "active" and self._within_window(k, now)
+        ]
+        if not candidates:
+            raise RuntimeError("no active signing key within validity window")
+        return max(candidates, key=lambda k: k.not_before)
+
+
 class KeyRing:
     def __init__(self, source: KeySource) -> None:
         self._source = source
@@ -114,3 +155,8 @@ class KeyRing:
         if not candidates:
             raise RuntimeError("no active signing key within validity window")
         return max(candidates, key=lambda k: k.not_before)
+
+    def snapshot(self) -> tuple[tuple[SigningKey, ...], int]:
+        """当前不可变快照 (密钥元组, 版本号)，用于打包发布批次。"""
+        snap = self._snapshot
+        return tuple(snap.keys.values()), snap.version

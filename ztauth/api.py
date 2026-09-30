@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from .errors import AuthError
 from .gateway import Gateway
+from .releases import ReleaseExpired, ReleaseNotFound
 
 
 def _json_default(obj):  # noqa: ANN001
@@ -32,6 +33,22 @@ def create_app(gateway: Gateway) -> FastAPI:
         return JSONResponse(
             status_code=403,
             content={"error": exc.reason.value, "detail": exc.detail},
+        )
+
+    @app.exception_handler(ReleaseNotFound)
+    async def _release_not_found_handler(request: Request, exc: ReleaseNotFound):  # noqa: ANN202
+        # 标识从未存在过（或非法）
+        return JSONResponse(
+            status_code=404,
+            content={"error": "release_not_found", "detail": str(exc)},
+        )
+
+    @app.exception_handler(ReleaseExpired)
+    async def _release_expired_handler(request: Request, exc: ReleaseExpired):  # noqa: ANN202
+        # 标识存在过，但已超出保留窗口
+        return JSONResponse(
+            status_code=410,
+            content={"error": "release_expired", "detail": str(exc)},
         )
 
     @app.post("/v1/authorize")
@@ -52,6 +69,7 @@ def create_app(gateway: Gateway) -> FastAPI:
             "effect": result.decision.effect.value,
             "policy_version": result.decision.policy_version,
             "rationale": result.decision.reason,
+            "release_id": result.release_id,
             "credential": (
                 None if cred is None else {
                     "name": cred.name,
@@ -65,5 +83,22 @@ def create_app(gateway: Gateway) -> FastAPI:
     @app.post("/v1/policies/reload")
     async def reload_policies():  # noqa: ANN201
         return {"policy_version": gateway.reload_policies()}
+
+    @app.post("/v1/releases/publish")
+    async def publish_release():  # noqa: ANN201
+        """把各单项组件的当前状态（可先 rotate/reload）打包成一个发布批次。
+
+        本地演示装配下：先在进程内完成密钥/凭据轮换、策略 reload，再调用本
+        端点即可让三者作为同一批次原子生效。
+        """
+        release_id = gateway.publish_batch()
+        return {"release_id": release_id}
+
+    @app.post("/v1/releases/rollback")
+    async def rollback_release(request: Request):  # noqa: ANN201
+        body = await request.json()
+        release_id = int(body["release_id"])
+        current_id = gateway.rollback_batch(release_id)
+        return {"release_id": current_id}
 
     return app
