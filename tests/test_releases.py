@@ -12,6 +12,8 @@ from ztauth.policy import Policy, Rule
 from ztauth.releases import ReleaseContent, ReleaseError, ReleaseManager
 from ztauth.sources import MutableReleaseSource
 
+from conftest import FakeClock as _FakeClock
+
 NOW = dt.datetime(2026, 9, 30, tzinfo=dt.timezone.utc)
 
 
@@ -163,7 +165,9 @@ def test_inflight_release_is_not_evicted_even_over_capacity():
 
 def test_unknown_kid_sustained_flood_reads_source_bounded_times():
     src = MutableReleaseSource(_content(1, kid="k1"))
-    mgr = ReleaseManager(src, max_retained=4, negative_cache_size=8)
+    clock = _FakeClock()
+    mgr = ReleaseManager(src, max_retained=4, negative_cache_size=8,
+                         reload_min_interval=1.0, clock=clock)
 
     # 8 个不同的未知 kid，每个被 16 个并发请求携带
     barrier = threading.Barrier(16)
@@ -181,12 +185,18 @@ def test_unknown_kid_sustained_flood_reads_source_bounded_times():
         t.start()
     for t in threads:
         t.join()
-    # 每个不同 kid 合并为一次真实读取：构造期 1 次 + 恰好 8 次，而非 128 次；
-    # 此后负缓存命中，读取次数不再增长
-    assert src.load_count == 9
-    for _ in range(64):
-        mgr.reload_for_unknown_kid(mgr.current(), "bogus-0")
-    assert src.load_count == 9
+    # 全局 single-flight + 节流：128 个并发请求只合并为 1 次真实读取，
+    # 而不是每个不同 kid 各一次（构造期 1 次 + 恰好 1 次）
+    assert src.load_count == 2
+    # 节流窗口内反复冲击（包括未入负缓存的 kid）：读取次数不再增长
+    for n in range(8):
+        for _ in range(8):
+            mgr.reload_for_unknown_kid(mgr.current(), f"bogus-{n}")
+    assert src.load_count == 2
+    # 窗口过后允许下一次真实回源：恰好 +1，与 kid 种类数无关
+    clock.advance(1.0)
+    mgr.reload_for_unknown_kid(mgr.current(), "bogus-9")
+    assert src.load_count == 3
 
 
 def test_unknown_kid_reload_publishes_new_batch_but_caller_stays_pinned():
@@ -230,20 +240,30 @@ def test_concurrent_unknown_kid_single_flight_per_batch():
 
 def test_negative_cache_is_bounded_lru():
     src = MutableReleaseSource(_content(1))
-    mgr = ReleaseManager(src, negative_cache_size=2)
+    clock = _FakeClock()
+    mgr = ReleaseManager(src, negative_cache_size=2,
+                         reload_min_interval=1.0, clock=clock)
     rel = mgr.current()
-    # 观察三个不同未知 kid：容量 2，最旧的 a 被挤出
+    # 每个间隔观察一个未知 kid：各自真实回源一次并进入负缓存；
+    # 容量 2，观察 c 时最旧的 a 被挤出
     for kid in ("a", "b", "c"):
         mgr.reload_for_unknown_kid(rel, kid)
+        clock.advance(1.0)
     assert src.load_count == 1 + 3
-    # b、c 命中负缓存
+    # 回退半个窗口，使后续检查落在 c 的节流窗口内
+    clock.advance(-0.5)
+    # b、c 命中负缓存，不再回源
     mgr.reload_for_unknown_kid(rel, "b")
     mgr.reload_for_unknown_kid(rel, "c")
     assert src.load_count == 1 + 3
-    # a 已被淘汰，再次出现会重新回源一次
+    # a 已被挤出：节流窗口内不出现第二轮回源
+    mgr.reload_for_unknown_kid(rel, "a")
+    assert src.load_count == 1 + 3
+    # 窗口过后 a 重新回源恰好一次（而不是每个被挤出的 kid 各一次）
+    clock.advance(1.0)
     mgr.reload_for_unknown_kid(rel, "a")
     assert src.load_count == 1 + 4
-    # 发布新批次后负缓存清空：旧的未知 kid 重新允许回源一次
+    # 发布新批次后负缓存清空、节流重置：旧的未知 kid 重新允许回源一次
     mgr.publish(_content(2, kid="k1"))
     mgr.reload_for_unknown_kid(mgr.current(), "c")
     assert src.load_count == 1 + 5

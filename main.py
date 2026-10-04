@@ -57,7 +57,8 @@ def _initial_content(now: dt.datetime) -> ReleaseContent:
 def _build() -> tuple[Gateway, MutableReleaseSource]:
     now = dt.datetime.now(dt.timezone.utc)
     source = MutableReleaseSource(_initial_content(now))
-    manager = ReleaseManager(source, max_retained=8)
+    # reload_min_interval 默认 1s：未知 kid 冲击下真实回源 <= 1 + 经过时间/间隔
+    manager = ReleaseManager(source, max_retained=8, reload_min_interval=1.0)
     return Gateway(released=manager, audit=AuditLogger()), source
 
 

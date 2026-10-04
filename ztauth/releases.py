@@ -11,19 +11,22 @@
 - 保留上限 max_retained：超限时按发布标识升序（最旧优先）淘汰；当前批次
   与仍有在途请求（引用计数 > 0）的批次不得淘汰，因此容量可能临时超限，
   等在途请求结束后再次尝试淘汰。
-- 未知 kid 的受控回源：per-kid single-flight（并发合并为一次真正的
-  ReleaseSource.load），double-check 后复用；另有有界 LRU 负缓存，保证
-  大量"当前批次不存在的 kid"持续冲击时，对上游的真实读取次数有确定上限。
-  回源读到含该 kid 的新整批内容时，将其作为一个新批次原子发布；发起请求
-  本身仍按其开始时固定的批次给出结论（不跨批）。
+- 未知 kid 的受控回源：全局 single-flight（并发请求——无论 kid 相同或不同——
+  合并为一次真正的 ReleaseSource.load），double-check 后复用；有界 LRU 负缓存
+  记录"已确认不含"的 kid；再加回源节流（reload_min_interval）：两次真实读取
+  之间至少间隔一个时间窗口。三者叠加保证：未知 kid 持续冲击下，对上游的真实
+  读取次数 <= 1 + 经过时间 / 间隔，与未知标识的种类数和请求总量无关；合法
+  密钥更新最迟在一个间隔后被发现。回源读到含该 kid 的新整批内容时，将其作为
+  一个新批次原子发布；发起请求本身仍按其开始时固定的批次给出结论（不跨批）。
 """
 from __future__ import annotations
 
 import contextlib
 import dataclasses
 import threading
+import time
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Protocol
 
 from .credentials import Credential
@@ -86,25 +89,31 @@ class ReleaseError(Exception):
 
 
 class _BoundedNegativeCache:
-    """有界 LRU：记录"已向上游确认不含"的 kid，阻止重复/无界回源。"""
+    """有界 LRU：记录"已向上游确认不含"的 kid 及确认时刻。
+
+    条目只在确认后的 ttl 窗口内被视为有效；过期后再次出现允许重新回源，
+    因此上游后来补发的合法密钥不会被陈旧的否定结论永久挡住。
+    """
 
     def __init__(self, capacity: int) -> None:
         if capacity < 1:
             raise ValueError("negative_cache_size must be >= 1")
         self._capacity = capacity
-        self._items: OrderedDict[str, None] = OrderedDict()
+        self._items: OrderedDict[str, float] = OrderedDict()
         self._lock = threading.Lock()
 
-    def contains(self, key: str) -> bool:
+    def is_fresh(self, key: str, now: float, ttl: float) -> bool:
+        """key 在缓存中且确认时刻距今不足 ttl 才算命中。"""
         with self._lock:
-            if key not in self._items:
+            ts = self._items.get(key)
+            if ts is None or now - ts >= ttl:
                 return False
             self._items.move_to_end(key)
             return True
 
-    def add(self, key: str) -> None:
+    def add(self, key: str, ts: float) -> None:
         with self._lock:
-            self._items[key] = None
+            self._items[key] = ts
             self._items.move_to_end(key)
             while len(self._items) > self._capacity:
                 self._items.popitem(last=False)
@@ -130,22 +139,29 @@ class ReleaseManager:
         initial: ReleaseContent | None = None,
         max_retained: int = 8,
         negative_cache_size: int = 256,
+        reload_min_interval: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_retained < 1:
             raise ValueError("max_retained must be >= 1")
+        if reload_min_interval < 0:
+            raise ValueError("reload_min_interval must be >= 0")
         if source is None and initial is None:
             raise ValueError("either source or initial content is required")
         self._source = source
         self._max_retained = max_retained
         self._negative = _BoundedNegativeCache(negative_cache_size)
+        self._reload_min_interval = float(reload_min_interval)
+        self._clock = clock
 
         self._lock = threading.Lock()          # 保护下列全部状态（临界区都很短）
         self._retained: dict[int, Release] = {}
         self._refs: dict[int, int] = {}
         self._next_id = 1
         self._current: Release | None = None
-        # per-kid 受控回源合并
-        self._reloading: dict[str, _InflightReload] = {}
+        # 未知 kid 受控回源：全局 single-flight + 节流
+        self._inflight: _InflightReload | None = None
+        self._last_reload_at: float | None = None
 
         if initial is not None:
             self._commit_locked(initial)
@@ -169,6 +185,7 @@ class ReleaseManager:
         with self._lock:
             rid = self._commit_locked(content)
             self._negative.clear()  # 新批次可能带来此前未知的 kid
+            self._last_reload_at = None  # 新批次后允许立即再回源一次
             self._evict_locked()
             return rid
 
@@ -248,29 +265,47 @@ class ReleaseManager:
         return self._current.id
 
     # ------------------------------------------------------------------ #
-    # 未知 kid：per-kid single-flight 受控回源 + 有界负缓存
+    # 未知 kid：全局 single-flight 受控回源 + 有界负缓存 + 回源节流
     # ------------------------------------------------------------------ #
     def reload_for_unknown_kid(self, release: Release, kid: str) -> None:
         """当前批次缺少 kid 时的受控回源。
 
-        - 负缓存命中：直接返回（调用方仍按原批次判 unknown，不会回源）；
-        - 同一 kid 的并发调用合并为一次真正的 source.load；
-        - 源内容含该 kid：作为新批次原子发布（调用方请求仍用原批次判定）；
-        - 源内容不含：记入有界负缓存；
-        - 源异常：向上抛出，所有并发等待方得到同一异常。
+        读取次数上限（确定、可断言）：
+            真实 load 次数 <= 1 + 经过时间 / reload_min_interval
+        与未知 kid 的种类数、请求总量、负缓存容量均无关。
+
+        - 负缓存命中（确认时刻距今不足一个间隔）：直接返回，不回源；
+          否定结论过期后自动失效，上游后来补发的合法密钥不会被永久挡住；
+        - 已有一次回源在途：等待其结束并复用结果（无论 kid 是否相同——
+          一次 load 读出的是整批内容，天然覆盖所有 kid）；
+        - 距上次真实回源不足 reload_min_interval：直接返回，按未知处理；
+          该 kid 不写入负缓存，因此间隔过后再次出现仍会触发真实回源，
+          合法的新密钥最迟在一个间隔后被发现；
+        - 源内容含该 kid 且不旧于当前密钥集合：作为新批次原子发布
+          （调用方请求仍用原批次判定）；
+        - 源内容不含：连同确认时刻记入有界负缓存；
+        - 源异常：向上抛出，所有并发等待方得到同一异常，不会被挂住。
         """
-        if self._negative.contains(kid):
+        now = self._clock()
+        if self._negative.is_fresh(kid, now, self._reload_min_interval):
             return
         with self._lock:
-            if self._negative.contains(kid):
+            now = self._clock()
+            if self._negative.is_fresh(kid, now, self._reload_min_interval):
                 return
-            inflight = self._reloading.get(kid)
-            if inflight is None:
-                inflight = _InflightReload(event=threading.Event())
-                self._reloading[kid] = inflight
-                leader = True
-            else:
+            if self._inflight is not None:
+                inflight = self._inflight
                 leader = False
+            else:
+                if (
+                    self._last_reload_at is not None
+                    and now - self._last_reload_at < self._reload_min_interval
+                ):
+                    return  # 节流窗口内：不回源，按未知处理（不入负缓存）
+                inflight = _InflightReload(event=threading.Event())
+                self._inflight = inflight
+                self._last_reload_at = now  # 无论成败都占住本窗口，保证上限
+                leader = True
 
         if not leader:
             inflight.event.wait()
@@ -290,12 +325,13 @@ class ReleaseManager:
                 # 不产生新批次，直接走负缓存。
                 self.publish(content)
             else:
-                self._negative.add(kid)
+                self._negative.add(kid, self._clock())
             inflight.error = None
         except BaseException as exc:  # 通知全部等待方，包括异常
             inflight.error = exc
             raise
         finally:
             with self._lock:
-                self._reloading.pop(kid, None)
+                if self._inflight is inflight:
+                    self._inflight = None
             inflight.event.set()

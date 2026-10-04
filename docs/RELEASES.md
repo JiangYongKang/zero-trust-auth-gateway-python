@@ -89,21 +89,41 @@ manager.in_flight(rid)   # 某批次当前在途请求数
 
 ## 5. 未知 kid 的受控回源（兼容原有单次重载语义）
 
-批次模式下遇到当前批次没有的 `kid`，行为与原 `KeyRing` 的受控重载对齐：
+批次模式下遇到当前批次没有的 `kid`，行为与原 `KeyRing` 的受控重载对齐，
+并在此基础上把"对上游的真实读取次数"收敛到一个**确定上限**：
 
-- **single-flight**：同一 `kid` 的并发请求合并为**一次**真正的
-  `ReleaseSource.load()`，其余线程等待并复用结果；double-check 保证
-  "同批并发加载只真正读上游一次"。
-- 源内容包含该 `kid` 且 `keys_version` 不旧于当前：整批内容原子发布为新批次；
-  但**发起回源的那个请求仍固定在旧批次**（旧批次没有该 kid），按
-  `token_unknown_kid` 结束——请求不跨批；后续新请求自然使用新批次。
-- `keys_version` 更旧的源内容被视为"源尚未更新"，不产生新批次。
-- 源不可用：映射为既有的 `token_key_reload_unavailable`。
-- **有界负缓存**（`negative_cache_size`，默认 **256**）：经上游确认不含的
-  `kid` 记入 LRU。因此大量请求持续携带当前批次不存在的密钥标识时：
-  - 每个不同 `kid` 最多触发一次真实读取；
-  - 负缓存之外的新增未知 `kid` 数量受 LRU 容量约束，真实读取次数不会无界增长；
-  - 每次发布新批次后负缓存清空（新批次可能带来此前未知的 `kid`）。
+```
+真实 load 次数 <= 构造期 1 次 + 1 + floor(经过时间 / reload_min_interval)
+```
+
+该上限只随时间增长，**与未知 kid 的种类数、请求总量、负缓存容量均无关**。
+它由三层机制叠加保证：
+
+- **全局 single-flight**：已有一次回源在途时，后续请求（无论 `kid` 相同
+  还是互不相同）都等待这一次 `ReleaseSource.load()` 并复用结果——一次
+  load 读出的是整批内容，天然覆盖所有 `kid`。大量并发携带同一个未知
+  `kid` 时最多真实读取一次；携带大量不同未知 `kid` 时读取次数也不会
+  放大到并发量级。
+- **回源节流**（`reload_min_interval`，默认 **1.0** 秒，`clock` 可注入
+  以便测试）：两次真实回源之间至少间隔一个窗口。窗口内到达的未知 `kid`
+  请求直接按 `token_unknown_kid` 结论返回，**不写入负缓存**，因此窗口
+  过后再次出现仍会触发真实回源。
+- **有界负缓存**（`negative_cache_size`，默认 **256**）：经上游确认不含
+  的 `kid` 连同**确认时刻**记入 LRU。条目只在确认后的一个节流窗口内
+  有效，过期自动失效——所以上游后来补发的合法密钥不会被陈旧的否定
+  结论永久挡住；每次发布新批次也会清空负缓存并重置节流。
+
+**合法密钥更新的发现时延**：新 `kid` 最迟在一个 `reload_min_interval`
+之后被真实回源发现；源内容包含该 `kid` 且 `keys_version` 不旧于当前时，
+整批内容原子发布为新批次，对后续请求生效。发起回源的那个请求仍固定在
+旧批次（旧批次没有该 kid），按 `token_unknown_kid` 结束——请求不跨批。
+`keys_version` 更旧的源内容被视为"源尚未更新"，不产生新批次。
+
+**上游失败时的表现**：真实回源抛出的异常会原样传给所有并发等待方
+（不会被挂住，也不会被吞成静默的 unknown），网关层映射为既有的
+`token_key_reload_unavailable`，与原单项路径结论一致；失败同样占住
+节流窗口，窗口内的后续请求按 `token_unknown_kid` 快速失败，窗口过后
+自动重试，上游恢复即正常。
 
 ## 6. 与原有单项轮换/热更新的兼容范围
 
@@ -144,11 +164,35 @@ previous/retired、过期判定）与原来完全一致，因为读取的是同�
 ```bash
 uv sync
 uv run pytest                                   # 全量（含发布批次新增用例）
+uv run pytest -v                                # 逐条列出各业务用例与执行结果
 uv run pytest tests/test_releases.py -q         # 发布/回退/淘汰/负缓存单元
 uv run pytest tests/test_release_gateway.py -q  # 三段同批、在途不换版
 uv run pytest tests/test_release_concurrency.py -q  # 高并发交错
 uv run pytest tests/test_release_api.py -q      # HTTP 端点与两类 404
+uv run pytest tests/test_unknown_kid_read_bound.py -v  # 未知 kid 读取上限专项
 uv run pytest -o log_cli=true -o log_cli_level=INFO   # 日志可见发布标识
+```
+
+未知 kid 读取上限的最小复现（不依赖测试框架，可直接照做）：
+
+```python
+from ztauth.releases import ReleaseManager
+from ztauth.sources import MutableReleaseSource
+# content 见上文 §2 的构造方式；clock 用列表模拟可推进的单调时钟
+src = MutableReleaseSource(content_v1)
+t = [1000.0]
+mgr = ReleaseManager(src, negative_cache_size=16,
+                     reload_min_interval=5.0, clock=lambda: t[0])
+
+rel = mgr.current()
+for n in range(1000):                       # 1000 种未知 kid 持续冲击
+    mgr.reload_for_unknown_kid(rel, f"ghost-{n}")
+assert src.load_count == 2                  # 构造期 1 次 + 窗口内恰好 1 次
+
+t[0] += 5.0                                 # 推进一个节流间隔
+for n in range(1000):
+    mgr.reload_for_unknown_kid(rel, f"ghost-{n}")
+assert src.load_count == 3                  # 每个间隔最多放行 1 次真实读取
 ```
 
 审计日志示例（成功/失败都带 `release_id`）：

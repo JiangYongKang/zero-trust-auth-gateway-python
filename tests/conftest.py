@@ -22,6 +22,19 @@ from ztauth.sources import MutableKeySource
 NOW = dt.datetime(2026, 9, 22, 0, 0, 0, tzinfo=dt.timezone.utc)
 
 
+class FakeClock:
+    """可手动推进的单调时钟：为回源节流的上限断言提供确定性时间。"""
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class StaticPolicySource:
     def __init__(self, policy: Policy) -> None:
         self.policy = policy
