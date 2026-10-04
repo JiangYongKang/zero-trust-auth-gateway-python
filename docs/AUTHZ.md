@@ -93,7 +93,8 @@ policy_version / rationale / release_id`。令牌本身、令牌片段与凭据�
 | `tests/test_policy_hot_reload.py` | 默认拒绝、deny 优先、缺属性单列、文件改写后热生效、结论可复现 |
 | `tests/test_credentials.py` | 最小权限、版本不存在/已失效区分、重叠期语义、过期、日志无明文 |
 | `tests/test_concurrent_authz.py` | 混合请求结论稳定、热更新不跨版本脏读、32 并发未知 kid 合并拉取 |
-| `tests/test_releases.py` | 单调发布标识、回退 never_existed/retired 区分、最旧优先淘汰、在途保护不提前淘汰、未知 kid 冲击读取上限、负缓存 LRU 边界、与单项轮换正交 |
+| `tests/test_releases.py` | 单调发布标识、回退 never_existed/retired 区分、最旧优先淘汰、在途保护不提前淘汰、未知 kid 冲击读取上限、回源时间闸门与发布复位、与单项轮换正交 |
+| `tests/test_unknown_kid_read_bound.py` | 未知 kid 读取次数确定上限：种类远超单批规模、种类数扫描、反复轮换、并发同/不同标识、合法更新及时发现、上游失败同一结论、上限公式 |
 | `tests/test_release_gateway.py` | 三段同批一致、成功/失败带发布标识、回退中途不换版、网关层两类回退错误 |
 | `tests/test_release_concurrency.py` | 发布/回退与 8 路鉴权交错不跨批、高频发布无空窗误拒、同批并发只读取一次 |
 | `tests/test_release_api.py` | HTTP 发布/回退/current、403 带批次、两类 404、旧装配无管理端点 |

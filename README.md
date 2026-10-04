@@ -29,7 +29,7 @@ JSON 策略与内存凭据库即可运行，无外部依赖（仅 FastAPI + pyte
 
 ```bash
 uv sync
-uv run pytest -q                       # 本地验证（45 个用例）
+uv run pytest -q                       # 本地验证（55 个用例）
 uv run uvicorn main:app --reload       # 启动演示服务（发布批次模式）
 ```
 
@@ -78,9 +78,13 @@ token = TokenIssuer(ring).issue(
 
 - 历史批次保留上限可配置（`max_retained`，默认 8）；超限按**发布标识最旧优先**
   淘汰，但当前批次与仍有在途请求的批次不会被提前淘汰（容量可能临时超限）。
-- 未知 kid 受控回源：同 kid 并发合并为一次真实上游读取（single-flight），
-  另有有界 LRU 负缓存（`negative_cache_size`，默认 256），未知标识持续冲击下
-  真实读取次数有确定上限；每次发布清空负缓存。
+- 未知 kid 受控回源：全局 single-flight（同一时刻全管理器最多一次真实上游
+  读取，并发等待方复用同一结果/同一异常）+ **时间闸门负缓存**
+  （`reload_cooldown`，默认 1.0s）：每次真实回源后冷却期内任何未知 kid 都
+  不再回源。上游内容不变时，任意时长 T 内真实读取次数 **≤ 2 + ⌊T /
+  reload_cooldown⌋**，与未知标识的种类数、请求总量、并发度无关；合法密钥
+  更新最迟在冷却结束后被发现并发布为新批次，上游失败时并发等待方得到同一
+  个明确失败（`token_key_reload_unavailable`）且冷却期内不重打上游。
 - 与原有单项能力（密钥重叠轮换、策略热更新、凭据 rotate/retire）**互不影响**：
   仍可直接使用 `Gateway(ring, policies, vault)`；批次模式构造为
   `Gateway(released=manager)`，原有 23 个用例全部保留。
@@ -119,10 +123,12 @@ uv run pytest tests/test_key_rotation.py -q
 uv run pytest tests/test_policy_hot_reload.py -q
 uv run pytest tests/test_credentials.py -q
 uv run pytest tests/test_concurrent_authz.py -q
-uv run pytest tests/test_releases.py -q             # 发布/回退/淘汰/负缓存
+uv run pytest tests/test_releases.py -q             # 发布/回退/淘汰/回源闸门
 uv run pytest tests/test_release_gateway.py -q      # 三段同批、在途不换版
 uv run pytest tests/test_release_concurrency.py -q  # 发布回退×并发鉴权交错
 uv run pytest tests/test_release_api.py -q          # HTTP 发布/回退/两类404
+uv run pytest tests/test_unknown_kid_read_bound.py -v \
+    -o log_cli=true -o log_cli_level=INFO           # 未知kid读取上限(8场景,日志可见)
 uv run pytest -o log_cli=true -o log_cli_level=INFO   # 打印请求标识/批次/版本/依据
 ```
 

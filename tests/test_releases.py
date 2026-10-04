@@ -161,9 +161,23 @@ def test_inflight_release_is_not_evicted_even_over_capacity():
     assert mgr.retained_ids() == (3,)
 
 
+class _FakeClock:
+    """可手动推进的单调时钟，用于确定性地验证回源时间闸门。"""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def test_unknown_kid_sustained_flood_reads_source_bounded_times():
+    clock = _FakeClock()
     src = MutableReleaseSource(_content(1, kid="k1"))
-    mgr = ReleaseManager(src, max_retained=4, negative_cache_size=8)
+    mgr = ReleaseManager(src, max_retained=4, reload_cooldown=1.0, clock=clock)
 
     # 8 个不同的未知 kid，每个被 16 个并发请求携带
     barrier = threading.Barrier(16)
@@ -181,12 +195,19 @@ def test_unknown_kid_sustained_flood_reads_source_bounded_times():
         t.start()
     for t in threads:
         t.join()
-    # 每个不同 kid 合并为一次真实读取：构造期 1 次 + 恰好 8 次，而非 128 次；
-    # 此后负缓存命中，读取次数不再增长
-    assert src.load_count == 9
-    for _ in range(64):
-        mgr.reload_for_unknown_kid(mgr.current(), "bogus-0")
-    assert src.load_count == 9
+    # 全局 single-flight + 时间闸门：128 个并发请求合并为恰好 1 次真实读取
+    assert src.load_count == 2  # 构造期 1 次 + 合并回源 1 次
+    # 闸门期内：同一批 kid 反复轮换、再涌入新 kid，都不再回源
+    for _ in range(3):
+        for n in range(8):
+            mgr.reload_for_unknown_kid(mgr.current(), f"bogus-{n}")
+    for n in range(100):
+        mgr.reload_for_unknown_kid(mgr.current(), f"fresh-{n}")
+    assert src.load_count == 2
+    # 冷却结束后才允许下一次真实回源（也仅一次）
+    clock.advance(1.1)
+    mgr.reload_for_unknown_kid(mgr.current(), "bogus-0")
+    assert src.load_count == 3
 
 
 def test_unknown_kid_reload_publishes_new_batch_but_caller_stays_pinned():
@@ -204,7 +225,7 @@ def test_unknown_kid_reload_publishes_new_batch_but_caller_stays_pinned():
 
 def test_concurrent_unknown_kid_single_flight_per_batch():
     src = MutableReleaseSource(_content(1, kid="k1"))
-    mgr = ReleaseManager(src, negative_cache_size=4)
+    mgr = ReleaseManager(src)
     barrier = threading.Barrier(32)
     errors: list[Exception] = []
 
@@ -228,25 +249,30 @@ def test_concurrent_unknown_kid_single_flight_per_batch():
     assert src.load_count == 2
 
 
-def test_negative_cache_is_bounded_lru():
+def test_reload_gate_is_time_based_not_per_kid():
+    clock = _FakeClock()
     src = MutableReleaseSource(_content(1))
-    mgr = ReleaseManager(src, negative_cache_size=2)
+    mgr = ReleaseManager(src, reload_cooldown=1.0, clock=clock)
     rel = mgr.current()
-    # 观察三个不同未知 kid：容量 2，最旧的 a 被挤出
+    # 闸门期内：再多的不同未知 kid 也只产生一次真实读取（与种类数无关）
     for kid in ("a", "b", "c"):
         mgr.reload_for_unknown_kid(rel, kid)
-    assert src.load_count == 1 + 3
-    # b、c 命中负缓存
-    mgr.reload_for_unknown_kid(rel, "b")
-    mgr.reload_for_unknown_kid(rel, "c")
-    assert src.load_count == 1 + 3
-    # a 已被淘汰，再次出现会重新回源一次
+    assert src.load_count == 1 + 1
+    # 同一批 kid 反复轮换也不会再次回源（旧实现中 LRU 淘汰会在此回源）
+    for _ in range(5):
+        for kid in ("a", "b", "c"):
+            mgr.reload_for_unknown_kid(rel, kid)
+    assert src.load_count == 1 + 1
+    # 冷却到期：下一个未知 kid 触发且仅触发一次新的真实读取
+    clock.advance(1.1)
     mgr.reload_for_unknown_kid(rel, "a")
-    assert src.load_count == 1 + 4
-    # 发布新批次后负缓存清空：旧的未知 kid 重新允许回源一次
+    assert src.load_count == 1 + 2
+    mgr.reload_for_unknown_kid(rel, "b")
+    assert src.load_count == 1 + 2
+    # 发布新批次复位闸门：新批次可能带来此前未知的 kid，允许立即回源一次
     mgr.publish(_content(2, kid="k1"))
     mgr.reload_for_unknown_kid(mgr.current(), "c")
-    assert src.load_count == 1 + 5
+    assert src.load_count == 1 + 3
 
 
 def test_legacy_single_component_rotation_orthogonal_to_releases():

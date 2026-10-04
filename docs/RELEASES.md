@@ -91,19 +91,73 @@ manager.in_flight(rid)   # 某批次当前在途请求数
 
 批次模式下遇到当前批次没有的 `kid`，行为与原 `KeyRing` 的受控重载对齐：
 
-- **single-flight**：同一 `kid` 的并发请求合并为**一次**真正的
-  `ReleaseSource.load()`，其余线程等待并复用结果；double-check 保证
-  "同批并发加载只真正读上游一次"。
+- **全局 single-flight**：同一时刻整个管理器最多只有**一次**真正的
+  `ReleaseSource.load()`。并发请求无论携带的 `kid` 是否相同，都等待同一次
+  读取并复用同一结果；读取失败时所有等待方得到**同一个异常**（不会被挂住），
+  经网关映射为既有的 `token_key_reload_unavailable`，与单项路径结论一致。
 - 源内容包含该 `kid` 且 `keys_version` 不旧于当前：整批内容原子发布为新批次；
   但**发起回源的那个请求仍固定在旧批次**（旧批次没有该 kid），按
   `token_unknown_kid` 结束——请求不跨批；后续新请求自然使用新批次。
 - `keys_version` 更旧的源内容被视为"源尚未更新"，不产生新批次。
 - 源不可用：映射为既有的 `token_key_reload_unavailable`。
-- **有界负缓存**（`negative_cache_size`，默认 **256**）：经上游确认不含的
-  `kid` 记入 LRU。因此大量请求持续携带当前批次不存在的密钥标识时：
-  - 每个不同 `kid` 最多触发一次真实读取；
-  - 负缓存之外的新增未知 `kid` 数量受 LRU 容量约束，真实读取次数不会无界增长；
-  - 每次发布新批次后负缓存清空（新批次可能带来此前未知的 `kid`）。
+
+### 5.1 读取次数上限：时间闸门负缓存
+
+> 旧实现按 `kid` 记有界 LRU 负缓存：未知 `kid` 种类超过容量后，被淘汰的
+> `kid` 再次出现会重新回源——压测中"种类足够多且不断变化"的未知标识可把
+> 上游真实读取打到无界（种类数 × 轮换轮次）。现改为**时间闸门**：
+
+- 每次真实回源（无论结果）后关闭闸门 `reload_cooldown` 秒（构造参数，
+  默认 **1.0**，时钟可注入便于测试）。闸门期内**任何**未知 `kid` 都不再
+  回源，直接按当前批次判定。
+- **确定上限**：上游内容不变时，任意时长 `T` 内真实读取次数
+  **≤ 2 + ⌊T / reload_cooldown⌋**（含构造期的首次读取；每个冷却窗口至多
+  一次）。该上限与未知 `kid` 的种类数、请求总量、并发度均无关：种类从
+  几十放大到几千、同一批标识反复轮换、64 路并发，读取次数都稳定在
+  "每个冷却窗口一次"附近。
+- **不漏掉合法更新**：回源读到含新 `kid` 的整批会原子发布新批次并**复位
+  闸门**；显式 `publish` 同样复位。上游密钥更新最迟在冷却结束后的下一次
+  未知 `kid` 请求中被发现（有界陈旧 ≤ `reload_cooldown`），随后立即对
+  后续请求生效。
+- **上游失败时的表现**：失败的一次回源同样关闭闸门并**缓存该异常**。并发
+  等待方与闸门期内的后续请求都立即得到同一个失败（网关侧
+  `token_key_reload_unavailable`），不会反复打到已故障的上游；冷却结束后
+  的下一个请求才允许重试一次。
+
+```python
+manager = ReleaseManager(source, max_retained=8,
+                         reload_cooldown=1.0)   # 未知 kid 回源冷却（秒）
+```
+
+### 5.2 本地可复现验证（读取上限）
+
+```bash
+# 8 个场景：种类远超单批规模 / 种类数扫描 / 反复轮换 / 并发同标识 /
+# 并发不同标识 / 合法更新及时发现 / 上游失败 / 上限公式
+uv run pytest tests/test_unknown_kid_read_bound.py -v \
+    -o log_cli=true -o log_cli_level=INFO
+```
+
+日志中每个场景都会打印"标识种类数 / 并发数 / 真实读取次数 / 上限"，例如：
+
+```
+场景2 种类数扫描: kids=2048 真实读取=2 上限=2
+场景8 上限公式: 请求=5000 标识种类=5000 真实读取=11 公式上限=12
+```
+
+也可以交互式复现（种类数、轮次可调，`load_count` 即上游真实读取次数）：
+
+```python
+from ztauth.releases import ReleaseManager
+from ztauth.sources import MutableReleaseSource
+# ... 构造 ReleaseContent（见 §2）...
+src = MutableReleaseSource(content_v1)
+mgr = ReleaseManager(src, reload_cooldown=1.0)
+for _ in range(3):                            # 同一批标识反复轮换
+    for i in range(1000):                     # 1000 种未知 kid
+        mgr.reload_for_unknown_kid(mgr.current(), f"bogus-{i}")
+assert src.load_count <= 3                    # 远小于 3000，且不再增长
+```
 
 ## 6. 与原有单项轮换/热更新的兼容范围
 
@@ -144,10 +198,12 @@ previous/retired、过期判定）与原来完全一致，因为读取的是同�
 ```bash
 uv sync
 uv run pytest                                   # 全量（含发布批次新增用例）
-uv run pytest tests/test_releases.py -q         # 发布/回退/淘汰/负缓存单元
+uv run pytest tests/test_releases.py -q         # 发布/回退/淘汰/回源闸门单元
 uv run pytest tests/test_release_gateway.py -q  # 三段同批、在途不换版
 uv run pytest tests/test_release_concurrency.py -q  # 高并发交错
 uv run pytest tests/test_release_api.py -q      # HTTP 端点与两类 404
+uv run pytest tests/test_unknown_kid_read_bound.py -v \
+    -o log_cli=true -o log_cli_level=INFO       # 未知 kid 读取上限（8 场景）
 uv run pytest -o log_cli=true -o log_cli_level=INFO   # 日志可见发布标识
 ```
 
